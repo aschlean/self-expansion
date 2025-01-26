@@ -102,7 +102,7 @@ def serve():
 
 @app.function(
     image=vllm_image,
-    gpu=gpu.L40S(count=NO_GPU),
+    gpu=gpu.H100(count=NO_GPU),
     container_idle_timeout=20 * SECONDS,
     volumes={MODELS_DIR: volume},
     mounts=[

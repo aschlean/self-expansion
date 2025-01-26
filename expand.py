@@ -1,7 +1,7 @@
 from typing import List, Literal
 from db import driver
 import structured_gen as sg
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from rich import print
 
 
@@ -26,6 +26,26 @@ class Answer(BaseModel):
     text: str
 
 
+class Feature(BaseModel):
+    type: Literal["Feature"]
+    text: str
+
+
+class PartnerFeature(BaseModel):
+    type: Literal["PartnerFeature"]
+    text: str
+
+
+class Usecase(BaseModel):
+    type: Literal["Usecase"]
+    text: str
+
+
+class UserGroup(BaseModel):
+    type: Literal["UserGroup"]
+    text: str
+
+
 # Permitted response formats
 class FromQuestion(BaseModel):
     """If at a question, may generate an answer."""
@@ -45,6 +65,48 @@ class FromAnswer(BaseModel):
 
     concepts: List[Concept]
     questions: List[Question]
+
+
+class FromCore(BaseModel):
+    """From core node, can ONLY connect to existing features and partner features"""
+    # These should only be for connecting, not creating new ones
+    features: List[str]  # Changed from List[Feature] to List[str] - just the text to connect to
+    partner_features: List[str]  # Changed from List[PartnerFeature] to List[str]
+
+
+class FromFeature(BaseModel):
+    """From feature node, can generate usecases by combining with partner features"""
+    usecases: List[Usecase] = Field(description="Generate usecases that specifically combine this feature with a partner feature. Each usecase must clearly indicate which partner feature it uses.")
+    partner_features: List[str]  # Only for connecting to existing ones
+
+
+class FromPartnerFeature(BaseModel):
+    """From partner feature node, can generate usecases by combining with features"""
+    features: List[str]  # Only for connecting to existing ones
+
+
+class FromUsecase(BaseModel):
+    """From usecase node, can connect to user groups. Must generate at least one user group."""
+    user_groups: List[UserGroup]
+    
+    # Add validator to ensure at least one user group is generated
+    @field_validator('user_groups')
+    def validate_user_groups(cls, v):
+        if not v:
+            raise ValueError("Must generate at least one user group for each usecase")
+        return v
+
+
+class FromUserGroup(BaseModel):
+    """From user group node, can connect to usecases and features"""
+    usecases: List[Usecase] = Field(description="""
+        Generate new usecases specific to this user group.
+        IMPORTANT: 
+        - Do not recreate similar usecases that already exist
+        - Focus on different feature combinations than what's already been used
+        - Each usecase must solve a distinct problem for this user group
+    """)
+    features: List[Feature]
 
 
 # Create a core node if it doesn't exist, or return the existing core node ID
@@ -409,7 +471,8 @@ def format_node_neighborhood(node_id, truncate: bool = True):
 def find_related_nodes(node_id: str):
     with driver.session() as session:
         result = {}
-        for node_type in ["Question", "Concept", "Answer"]:
+        # Updated to include all our new node types
+        for node_type in ["Feature", "PartnerFeature", "Usecase", "UserGroup"]:
             result[node_type] = session.run(
                 """
                 MATCH (m {id: $node_id})
@@ -438,11 +501,86 @@ def remove_index(index_name: str):
         )
 
 
-def main(do_clear_db=False, purpose="Support humanity"):
+def main(
+    do_clear_db=True, 
+    purpose="Find high quality use cases for Firecrawl with Outlines"
+):
+    # Define our core features
+    firecrawl_features = [
+        """Convert any webpage into clean, structured markdown via /scrape endpoint.
+        Input: Any URL
+        Output: Clean markdown text with preserved structure, links, and important content
+        Use for: Converting web content into a format suitable for LLM processing""",
+        
+        """Extract webpage metadata via /scrape endpoint.
+        Input: Any URL
+        Output: Title, description, OpenGraph tags, author info
+        Use for: Getting structured metadata about web pages""",
+        
+        """Batch process multiple URLs via /scrape endpoint.
+        Input: List of URLs
+        Output: Markdown and metadata for each URL
+        Use for: Processing entire content collections at once""",
+
+        """Discover and process all pages on a website via /crawl endpoint.
+        Input: Starting URL
+        Output: Processed content from all discovered pages
+        Use for: Complete website content extraction""",
+        
+        """Generate website structure map via /map endpoint.
+        Input: Website URL
+        Output: Complete site structure and URL list
+        Use for: Content auditing and site mapping""",
+
+        """Extract specific data from web content via /extract endpoint.
+        Input: URL + extraction schema
+        Output: Structured data matching schema
+        Use for: Converting web content into structured data""",
+        
+        """Extract unstructured data via /extract endpoint.
+        Input: URL + extraction prompt
+        Output: Extracted information based on a prompt
+        Use for: Flexible data extraction without rigid schemas"""
+    ]
+
+    outlines_features = [
+        """Generate text from LLM matching exact JSON schema.
+        Input: Schema + prompt
+        Output: Text conforming to schema
+        Use for: Getting structured text responses""",
+        
+        """Generate text from LLM following grammar (CFG)rules.
+        Input: Grammar definition + prompt
+        Output: Text following grammar
+        Use for: Getting consistently formatted text""",
+        
+        """Generate text from LLM with type constraints.
+        Input: Pydantic model + prompt
+        Output: Type-safe text data
+        Use for: Getting properly typed data from LLMs""",
+        
+        """Stream generation results from LLM in real-time.
+        Input: Generation request
+        Output: Token stream
+        Use for: Real-time text processing""",
+        
+        """Validate outputs from LLM against schemas.
+        Input: Generated text + schema
+        Output: Validation result
+        Use for: Ensuring output quality"""
+    ]
+
     # Clear the database if requested
     if do_clear_db:
         print("WARNING: Clearing the database")
         clear_db()
+
+    # Load our predefined features
+    load_initial_data(
+        features=firecrawl_features,
+        partner_features=outlines_features,
+        core_text=purpose
+    )
 
     # Create the core node and get its ID
     current_node_id = get_or_make_core(purpose)
@@ -453,23 +591,25 @@ def main(do_clear_db=False, purpose="Support humanity"):
 
     # Remove existing indices
     remove_index("core_id")
-    remove_index("question_embedding")
-    remove_index("concept_embedding")
-    remove_index("answer_embedding")
+    remove_index("feature_embedding")
+    remove_index("partner_feature_embedding")
+    remove_index("usecase_embedding")
+    remove_index("user_group_embedding")
 
     # Create indices
     with driver.session() as session:
         # Create regular indices
         index_queries = [
             "CREATE INDEX core_id IF NOT EXISTS FOR (n:Core) ON (n.id)",
-            "CREATE INDEX question_id IF NOT EXISTS FOR (n:Question) ON (n.id)",
-            "CREATE INDEX concept_id IF NOT EXISTS FOR (n:Concept) ON (n.id)",
-            "CREATE INDEX answer_id IF NOT EXISTS FOR (n:Answer) ON (n.id)",
+            "CREATE INDEX feature_id IF NOT EXISTS FOR (n:Feature) ON (n.id)",
+            "CREATE INDEX partner_feature_id IF NOT EXISTS FOR (n:PartnerFeature) ON (n.id)",
+            "CREATE INDEX usecase_id IF NOT EXISTS FOR (n:Usecase) ON (n.id)",
+            "CREATE INDEX user_group_id IF NOT EXISTS FOR (n:UserGroup) ON (n.id)",
         ]
 
         # Create vector indices
         vector_index_queries = []
-        for node_type in ["Question", "Concept", "Answer"]:
+        for node_type in ["Feature", "PartnerFeature", "Usecase", "UserGroup"]:
             vector_index_queries.append(
                 f"""
                 CREATE VECTOR INDEX {node_type.lower()}_embedding IF NOT EXISTS
@@ -495,8 +635,7 @@ def main(do_clear_db=False, purpose="Support humanity"):
         current_node_text = current_node["node_text"]
         current_node_label = current_node["label"]
 
-        # Get the user prompt. Shows previous nodes and actions, then
-        # shows the current node.
+        # Get the user prompt
         prompt = (
             "\n".join([f"{n['label'].upper()} {n['node_text']}" for n in history])
             + f"\nCurrent node: {current_node_label.upper()} {current_node_text}"
@@ -505,17 +644,18 @@ def main(do_clear_db=False, purpose="Support humanity"):
         # prompt += f"Here are nodes related to the current node:\n" +\
         #       format_node_neighborhood(current_node_id, truncate=False)
 
-        # Check current node type
+        # Check current node type and set result format
         result_format = None
-        if current_node_label == "Question":
-            # May only extract concepts and observations from questions
-            result_format = FromQuestion
-        elif current_node_label == "Concept" or current_node_label == "Core":
-            # May generate other concepts, new questions, or new observations
-            result_format = FromConcept
-        elif current_node_label == "Answer":
-            # May generate new concepts or new questions
-            result_format = FromAnswer
+        if current_node_label == "Core":
+            result_format = FromCore
+        elif current_node_label == "Feature":
+            result_format = FromFeature
+        elif current_node_label == "PartnerFeature":
+            result_format = FromPartnerFeature
+        elif current_node_label == "Usecase":
+            result_format = FromUsecase
+        elif current_node_label == "UserGroup":
+            result_format = FromUserGroup
         else:
             raise ValueError(f"Unknown node type: {current_node_label}")
 
@@ -524,28 +664,49 @@ def main(do_clear_db=False, purpose="Support humanity"):
         You are a superintelligent AI building a self-expanding knowledge graph.
         Your goal is to achieve the core directive "{purpose}".
 
-        Generate an expansion of the current node. An expansion may include:
+        Generate an expansion of the current node. Based on the node type, an expansion may include:
 
-        - A list of new questions.
-            - Questions should be short and direct.
-            - If you generate multiple questions, they should be distinct and not similar.
-        - A list of new concepts.
-            - Concepts are words or short combinations of words that
-              are related to the current node.
-        - Concepts may connect to each other.
-            - Concepts may be related by IS_A, AFFECTS, or CONNECTS_TO.
-            - IS_A: A concept is a type of another concept.
-            - AFFECTS: A concept is related to another concept because it affects it.
-            - CONNECTS_TO: A concept is generally related to another concept.
-        - A list of new answers.
-            - Answers should be concise and to the point.
+        1. At CORE node:
+           - ONLY connect to existing features and partner features
+           - DO NOT generate new features or partner features
+           - DO NOT create any other node types
 
-        When concepts can be generated, try to do so. They're important.
+        2. At FEATURE node:
+           - EXAMINE connected partner features in the graph
+           - GENERATE use cases that specifically combine:
+             * The current feature AND
+             * One connected partner feature
+           - Each usecase must clearly describe how the feature and partner feature work together
+           - DO NOT generate new features or partner features
 
-        Your role is to understand the core directive "{purpose}".
+        3. At PARTNER_FEATURE node:
+           - EXAMINE connected features in the graph
+           - GENERATE use cases that specifically combine:
+             * The current partner feature AND
+             * One connected feature
+           - Each usecase must clearly describe how they work together
+           - DO NOT generate new partner features
 
-        Respond in the following JSON format:
-        {result_format.model_json_schema()}
+        4. At USECASE node:
+           - ONLY generate user groups that would benefit from this use case
+           - MUST generate at least one specific user group for EACH use case
+           - Each user group must be specific and well-defined
+           - DO NOT generate any other node types
+
+        5. At USER_GROUP node:
+           - GENERATE use cases specific to this user group
+           - Each usecase must be DISTINCTLY DIFFERENT from existing ones
+           - Use different feature + partner feature combinations
+           - Focus on unique problems and solutions
+           - DO NOT recreate similar usecases with minor variations
+           - CONNECT to existing features the group would use
+           - DO NOT generate new features
+
+        IMPORTANT:
+        - Each use case MUST combine one feature with one partner feature
+        - Always specify the feature + partner feature combination in use case descriptions
+        - ONLY use features and partner features from the initial lists
+        - DO NOT generate new features or partner features at any point
         """
 
         # Generate an expansion
@@ -567,38 +728,35 @@ def main(do_clear_db=False, purpose="Support humanity"):
             )
         except Exception as e:
             print(f"Error generating expansion: {e}")
-            # Return to the core node
             current_node_id = core_node_id
             continue
 
-        # Link the new nodes to the current node.
-        # If we are at a question, we can only provide answers.
-        if current_node_label == "Question":
-            for answer in expansion.answer:
-                answer_to_question(answer.text, current_node_text)
+        # Link the new nodes based on current node type
+        if current_node_label == "Core":
+            for feature in expansion.features:
+                core_has_feature(current_node_text, feature)
+            for partner_feature in expansion.partner_features:
+                core_connects_partner_feature(current_node_text, partner_feature)
 
-        # If we are at a concept, we can link to the questions and concepts.
-        elif current_node_label == "Concept":
-            for purpose in expansion.questions:
-                concept_to_question(current_node_text, purpose.text)
-            for concept in expansion.concepts:
-                concept_to_concept(
-                    current_node_text, concept.text, concept.relationship_type
-                )
+        elif current_node_label == "Feature":
+            for usecase in expansion.usecases:
+                feature_enables_usecase(current_node_text, usecase.text)
+            for partner_feature in expansion.partner_features:
+                partner_feature_connects_feature(partner_feature, current_node_text)
 
-        # If we are at an answer, we can link to the concepts and questions.
-        elif current_node_label == "Answer":
-            for concept in expansion.concepts:
-                answer_to_concept(current_node_text, concept.text)
-            for purpose in expansion.questions:
-                answer_to_question(current_node_text, purpose.text)
+        elif current_node_label == "PartnerFeature":
+            for feature in expansion.features:
+                partner_feature_connects_feature(current_node_text, feature)
 
-        # If we are at a core, we can link to the questions and concepts.
-        elif current_node_label == "Core":
-            for purpose in expansion.questions:
-                core_to_question(current_node_text, purpose.text)
-            for concept in expansion.concepts:
-                concept_to_core(concept.text, current_node_text)
+        elif current_node_label == "Usecase":
+            for user_group in expansion.user_groups:
+                usecase_benefits_user_group(current_node_text, user_group.text)
+
+        elif current_node_label == "UserGroup":
+            for usecase in expansion.usecases:
+                user_group_uses_usecase(current_node_text, usecase.text)
+            for feature in expansion.features:
+                user_group_uses_feature(current_node_text, feature.text)
 
         # Grab the current node's neighbors and format them for display
         neighbors = load_neighbors(current_node_id)
@@ -609,6 +767,12 @@ def main(do_clear_db=False, purpose="Support humanity"):
             uuid_to_simple_mapping,
             simple_to_uuid_mapping,
         ) = format_node_neighborhood(current_node_id)
+
+        # Check graph balance and usecase count
+        balance_message, usecase_count = check_graph_balance()
+        if usecase_count >= 30:  # Stop if we've reached 30 usecases
+            print("\nReached target number of use cases (30). Stopping expansion.")
+            break
 
         # Choose a new node if there are any neighbors
         if len(neighbors) > 0:
@@ -639,6 +803,7 @@ def main(do_clear_db=False, purpose="Support humanity"):
             choice_prompt = (
                 prompt
                 + "Select a node to traverse to. Respond with the node ID."
+                + balance_message
                 + "You will generate a new expansion of the node you traverse to."
                 + "You will not be able to choose the current node."
                 + "You may choose 'random' to choose a random node."
@@ -674,11 +839,314 @@ def main(do_clear_db=False, purpose="Support humanity"):
             record_traversal(old_node_id, current_node_id, traversal_type)
 
 
+def core_has_feature(core: str, feature: str):
+    with driver.session() as session:
+        # First verify the feature exists
+        result = session.run(
+            """
+            MATCH (feature:Feature {text: $feature})
+            RETURN feature
+            """,
+            feature=feature
+        )
+        if not result.data():
+            print(f"Skipping connection - feature does not exist: {feature}")
+            return
+
+        # Then create the connection
+        session.run(
+            """
+            MERGE (core:Core {text: $core})
+            ON CREATE SET core.id = randomUUID()
+            WITH core
+            MATCH (feature:Feature {text: $feature})
+            MERGE (core)-[:HAS]->(feature)
+            """,
+            core=core,
+            feature=feature
+        )
+
+
+def core_connects_partner_feature(core: str, partner_feature: str):
+    with driver.session() as session:
+        # First verify the partner feature exists
+        result = session.run(
+            """
+            MATCH (partner:PartnerFeature {text: $partner_feature})
+            RETURN partner
+            """,
+            partner_feature=partner_feature
+        )
+        if not result.data():
+            print(f"Skipping connection - partner feature does not exist: {partner_feature}")
+            return
+
+        # Then create the connection
+        session.run(
+            """
+            MERGE (core:Core {text: $core})
+            ON CREATE SET core.id = randomUUID()
+            WITH core
+            MATCH (partner:PartnerFeature {text: $partner_feature})
+            MERGE (core)-[:CONNECTS]->(partner)
+            """,
+            core=core,
+            partner_feature=partner_feature
+        )
+
+
+def partner_feature_connects_feature(partner_feature: str, feature: str):
+    with driver.session() as session:
+        # First verify both nodes exist
+        result = session.run(
+            """
+            MATCH (partner:PartnerFeature {text: $partner_feature})
+            MATCH (feature:Feature {text: $feature})
+            RETURN partner, feature
+            """,
+            partner_feature=partner_feature,
+            feature=feature
+        )
+        if not result.data():
+            print(f"Skipping connection - one or both nodes don't exist: {partner_feature} -> {feature}")
+            return
+
+        # Then create only the connection
+        session.run(
+            """
+            MATCH (partner:PartnerFeature {text: $partner_feature})
+            MATCH (feature:Feature {text: $feature})
+            MERGE (partner)-[:CONNECTS]->(feature)
+            """,
+            partner_feature=partner_feature,
+            feature=feature
+        )
+
+
+def feature_enables_usecase(feature: str, usecase: str):
+    with driver.session() as session:
+        # First verify the feature exists
+        result = session.run(
+            """
+            MATCH (feature:Feature {text: $feature})
+            RETURN feature
+            """,
+            feature=feature
+        )
+        if not result.data():
+            print(f"Skipping connection - feature does not exist: {feature}")
+            return
+
+        # Create usecase and connection
+        try:
+            usecase_embedding = sg.embed(usecase)
+            session.run(
+                """
+                MATCH (feature:Feature {text: $feature})
+                MERGE (usecase:Usecase {text: $usecase})
+                ON CREATE SET usecase.id = randomUUID(), 
+                             usecase.embedding = $usecase_embedding
+                MERGE (feature)-[:ENABLES]->(usecase)
+                """,
+                feature=feature,
+                usecase=usecase,
+                usecase_embedding=usecase_embedding
+            )
+        except Exception as e:
+            print(f"Error creating usecase connection: {e}")
+
+
+def usecase_benefits_user_group(usecase: str, user_group: str):
+    with driver.session() as session:
+        # First verify the usecase exists
+        result = session.run(
+            """
+            MATCH (usecase:Usecase {text: $usecase})
+            RETURN usecase
+            """,
+            usecase=usecase
+        )
+        if not result.data():
+            print(f"Skipping connection - usecase does not exist: {usecase}")
+            return
+
+        # Create user group (this is allowed) and connection
+        try:
+            user_group_embedding = sg.embed(user_group)
+            session.run(
+                """
+                MATCH (usecase:Usecase {text: $usecase})
+                MERGE (user_group:UserGroup {text: $user_group})
+                ON CREATE SET user_group.id = randomUUID(),
+                             user_group.embedding = $user_group_embedding
+                MERGE (usecase)-[:BENEFITS]->(user_group)
+                """,
+                usecase=usecase,
+                user_group=user_group,
+                user_group_embedding=user_group_embedding
+            )
+        except Exception as e:
+            print(f"Error creating user group connection: {e}")
+
+
+def user_group_uses_usecase(user_group: str, usecase: str):
+    with driver.session() as session:
+        # First verify the user group exists
+        result = session.run(
+            """
+            MATCH (user_group:UserGroup {text: $user_group})
+            RETURN user_group
+            """,
+            user_group=user_group
+        )
+        if not result.data():
+            print(f"Skipping connection - user group does not exist: {user_group}")
+            return
+
+        # Create usecase (this is allowed) and connection
+        try:
+            usecase_embedding = sg.embed(usecase)
+            session.run(
+                """
+                MATCH (user_group:UserGroup {text: $user_group})
+                MERGE (usecase:Usecase {text: $usecase})
+                ON CREATE SET usecase.id = randomUUID(),
+                             usecase.embedding = $usecase_embedding
+                MERGE (user_group)-[:USES]->(usecase)
+                """,
+                user_group=user_group,
+                usecase=usecase,
+                usecase_embedding=usecase_embedding
+            )
+        except Exception as e:
+            print(f"Error creating usecase connection: {e}")
+
+
+def user_group_uses_feature(user_group: str, feature: str):
+    with driver.session() as session:
+        # First verify both nodes exist
+        result = session.run(
+            """
+            MATCH (user_group:UserGroup {text: $user_group})
+            MATCH (feature:Feature {text: $feature})
+            RETURN user_group, feature
+            """,
+            user_group=user_group,
+            feature=feature
+        )
+        if not result.data():
+            print(f"Skipping connection - one or both nodes don't exist: {user_group} -> {feature}")
+            return
+
+        # Then create only the connection
+        session.run(
+            """
+            MATCH (user_group:UserGroup {text: $user_group})
+            MATCH (feature:Feature {text: $feature})
+            MERGE (user_group)-[:USES]->(feature)
+            """,
+            user_group=user_group,
+            feature=feature
+        )
+
+
+def load_initial_data(features: List[str], partner_features: List[str], core_text: str):
+    """
+    Load initial features and partner features into the graph and connect them to the core node.
+    
+    Args:
+        features: List of feature descriptions
+        partner_features: List of partner feature descriptions
+        core_text: The core node text/purpose
+    """
+    print("Loading initial data...")
+    
+    # First create/get the core node
+    core_id = get_or_make_core(core_text)
+    
+    with driver.session() as session:
+        # First create all features
+        for feature in features:
+            try:
+                print(f"Creating feature: {feature}")
+                feature_embedding = sg.embed(feature)
+                session.run(
+                    """
+                    MERGE (feature:Feature {text: $feature})
+                    ON CREATE SET feature.id = randomUUID(), 
+                                 feature.embedding = $feature_embedding
+                    """,
+                    feature=feature,
+                    feature_embedding=feature_embedding
+                )
+            except Exception as e:
+                print(f"Error creating feature {feature}: {e}")
+                
+        # Then create all partner features
+        for partner_feature in partner_features:
+            try:
+                print(f"Creating partner feature: {partner_feature}")
+                partner_embedding = sg.embed(partner_feature)
+                session.run(
+                    """
+                    MERGE (partner:PartnerFeature {text: $partner_feature})
+                    ON CREATE SET partner.id = randomUUID(),
+                                 partner.embedding = $partner_embedding
+                    """,
+                    partner_feature=partner_feature,
+                    partner_embedding=partner_embedding
+                )
+            except Exception as e:
+                print(f"Error creating partner feature {partner_feature}: {e}")
+        
+        # Now connect everything to core
+        for feature in features:
+            try:
+                print(f"Connecting feature to core: {feature}")
+                core_has_feature(core_text, feature)
+            except Exception as e:
+                print(f"Error connecting feature {feature}: {e}")
+                
+        for partner_feature in partner_features:
+            try:
+                print(f"Connecting partner feature to core: {partner_feature}")
+                core_connects_partner_feature(core_text, partner_feature)
+            except Exception as e:
+                print(f"Error connecting partner feature {partner_feature}: {e}")
+                
+    print("Initial data loading complete!")
+
+
+def check_graph_balance():
+    with driver.session() as session:
+        # First check if we have any usecases
+        result = session.run("""
+            MATCH (u:Usecase)
+            RETURN count(DISTINCT u) as usecase_count
+        """)
+        usecase_data = result.single()
+        if not usecase_data or usecase_data["usecase_count"] == 0:
+            return "", 0  # Return both message and count when no usecases exist
+            
+        # Then check user groups
+        result = session.run("""
+            MATCH (g:UserGroup)
+            RETURN count(DISTINCT g) as group_count
+        """)
+        group_data = result.single()
+        group_count = group_data["group_count"] if group_data else 0
+        
+        usecase_count = usecase_data["usecase_count"]
+        if usecase_count - group_count >= 2:
+            print("Consider traversing to a usecase node to generate more user groups.")
+            return "Consider traversing to a usecase node to generate more user groups.", usecase_count
+        return "", usecase_count
+
 if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Run a self-expanding knowledge graph around a core purpose."
+        description="Run a self-expanding knowledge graph around Firecrawl and Outlines integration."
     )
 
     parser.add_argument(
@@ -687,13 +1155,7 @@ if __name__ == "__main__":
         action="store_true",
         help="If set, clear the database before proceeding.",
     )
-    parser.add_argument(
-        "--purpose",
-        type=str,
-        default="Support humanity",
-        help='Set the purpose (default: "Support humanity").',
-    )
 
     args = parser.parse_args()
 
-    main(args.do_clear_db, args.purpose)
+    main(args.do_clear_db)
